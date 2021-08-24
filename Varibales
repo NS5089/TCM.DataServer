@@ -1,0 +1,233 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Timers;
+using TCM_DataModel;
+using System.Linq;
+using Tetherfi.Common.Utility.Extensions;
+
+namespace TCM.DataServer
+{
+    [Serializable]
+    public class ContactSession : IDisposable
+    {
+        private static readonly Logger.Logger log = new Logger.Logger(typeof(ContactSession));
+
+        #region Public Members
+        public DataServerModel data; //will hold the item
+        #endregion
+
+        Timer timer; //will hanlde the expiry
+        private static ConcurrentDictionary<string, ContactSession> contactList = new ConcurrentDictionary<string, ContactSession>();//will be used to remove the item once it is expired
+
+        public static ContactSession Get(string contactId)
+        {
+            ContactSession contactSession = null;
+            contactList.TryGetValue(contactId, out contactSession);
+            if (contactSession != null)
+            {
+                return contactSession;
+            }
+            return null;
+        }
+
+        public static List<ContactSession> GetAll()
+        {
+            return contactList.Values.ToList();
+        }
+
+        public static bool AddOrUpdate(CampaignContactModel contact, int startRangeInHours, int endRangeInHours)
+        {
+            try
+            {
+                DateTime StartDate = DateTime.Now.AddHours(-startRangeInHours);
+                DateTime EndDate = DateTime.Now.AddHours(endRangeInHours);
+
+                //if there is no scheudled datetime then take current date as considering last updated date
+                DateTime ScheduledDateTime = string.IsNullOrEmpty(contact.ScheduleTime) ?
+                     DateTime.ParseExact(contact.LastChangedOn, "yyyyMMddHHmmss", CultureInfo.InvariantCulture) :
+                    DateTime.ParseExact(contact.ScheduleTime, "yyyyMMddHHmmss", CultureInfo.InvariantCulture);
+
+                if (ScheduledDateTime < StartDate)
+                {
+                    log.Debug("NotAdded: Request Time is less than Configured Hours");
+                    return false;
+                }
+
+                if (ScheduledDateTime > EndDate)
+                {
+                    log.Debug("NotAdded: Request Time is more than Configured Hours");
+                    return false;
+                }
+
+                TimeSpan expires = ScheduledDateTime.Subtract(StartDate);
+                if (expires.TotalMilliseconds > 0)
+                {
+                    var _contactSession = new ContactSession(contact, startRangeInHours, endRangeInHours, expires.TotalMilliseconds);
+                    // update the campaign status in the model before send
+                    var campSession = CampaignSession.Get(contact.CampId);
+                    if (campSession != null)
+                    {
+                        _contactSession.data.campStatus = campSession.Status;
+                    }
+
+                    contactList.AddOrUpdate(contact.Id, _contactSession, (key, oldValue) => _contactSession);
+
+                    if (!string.IsNullOrEmpty(contact.DirectAgent))
+                    {
+                        int retValue = TmacDataServerClient.TmacDataClient.SendDataToAgent(contact.DirectAgent, _contactSession.data.ToJsonSerializeObject());
+                        log.Debug("SendDataToAgent:return " + retValue);
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log.Debug("Excpetion in AddOrUpdate " + ex);
+            }
+
+            return false;
+        }
+
+        public static bool Update(ContactSession _contactSession)
+        {
+            try
+            {
+                CampaignContactModel contact = _contactSession.data.contact;
+                // update the campaign status in the model before send
+                var campSession = CampaignSession.Get(contact.CampId);
+                if (campSession != null)
+                {
+                    _contactSession.data.campStatus = campSession.Status;
+                }
+
+                contactList.TryUpdate(contact.Id, _contactSession, null);
+
+                if (!string.IsNullOrEmpty(contact.DirectAgent))
+                {
+                    var retValue = TmacDataServerClient.TmacDataClient.SendDataToAgent(contact.DirectAgent, _contactSession.data.ToJsonSerializeObject());
+                    log.Debug("SendDataToAgent:return " + retValue);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log.Debug("Excpetion in Update " + ex);
+            }
+            return false;
+        }
+
+        public static bool UpdateStatus(string contactId, string status)
+        {
+            try
+            {
+                ContactSession _contactSession = Get(contactId);
+                if (_contactSession != null && _contactSession.data != null && _contactSession.data.contact != null)
+                {
+                    _contactSession.data.contact.Status = status;
+                    contactList.TryUpdate(contactId, _contactSession, null);
+
+                    if (!string.IsNullOrEmpty(_contactSession.data.contact.DirectAgent))
+                    {
+                        var retValue = TmacDataServerClient.TmacDataClient.SendDataToAgent(_contactSession.data.contact.DirectAgent, _contactSession.data.ToJsonSerializeObject());
+                        log.Debug("SendDataToAgent:return " + retValue);
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log.Debug("Excpetion in UpdateStatus " + ex);
+            }
+            return false;
+        }
+
+        public ContactSession(CampaignContactModel _contact, int startRangeInHours, int endRangeInHours, double expires)
+        {
+            data = new DataServerModel()
+            {
+                startRangeInHours = startRangeInHours,
+                endRangeInHours = endRangeInHours,
+                expires = expires,
+                contact = _contact,
+            };
+
+            timer = new Timer(expires);
+            timer.Elapsed += new ElapsedEventHandler(Elapsed_Event);
+            timer.Start();
+        }
+
+        private void Elapsed_Event(object sender, ElapsedEventArgs e)
+        {
+            timer.Elapsed -= new ElapsedEventHandler(Elapsed_Event);
+            Remove(this.data.contact.Id);
+        }
+
+        public static bool Remove(string contactId)
+        {
+            var isSuccess = false;
+            try
+            {
+                ContactSession _contactSession = null;
+                contactList.TryRemove(contactId, out _contactSession);
+                var contact = _contactSession.data.contact;
+                if (_contactSession.data != null && _contactSession.data.contact != null && !string.IsNullOrEmpty(_contactSession.data.contact.DirectAgent))
+                {
+                    _contactSession.data.contact.Status = "Deleted";
+                    var retValue = TmacDataServerClient.TmacDataClient.SendDataToAgent(contact.DirectAgent, _contactSession.data.ToJsonSerializeObject());
+                    log.Debug("SendDataToAgent:return " + retValue);
+                    isSuccess = true;
+                }
+                if (_contactSession != null)
+                    _contactSession.Dispose();               
+            }
+            catch (Exception ex)
+            {
+                log.Debug("Excpetion in Remove " + ex);
+            }
+
+            return isSuccess;
+        }
+
+
+        #region IDisposable Support
+        private bool disposedValue = false; // To detect redundant calls
+
+        protected virtual void Dispose(bool disposing)
+        {
+            timer.Elapsed -= new ElapsedEventHandler(Elapsed_Event);
+            if (!disposedValue)
+            {
+                if (disposing)
+                {
+                    // TODO: dispose managed state (managed objects).
+                }
+
+                // TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
+                // TODO: set large fields to null.
+
+                disposedValue = true;
+            }
+        }
+
+        // TODO: override a finalizer only if Dispose(bool disposing) above has code to free unmanaged resources.
+        // ~ContactSession() {
+        //   // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+        //   Dispose(false);
+        // }
+
+        // This code added to correctly implement the disposable pattern.
+        public void Dispose()
+        {
+            // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+            Dispose(true);
+            // TODO: uncomment the following line if the finalizer is overridden above.
+            // GC.SuppressFinalize(this);
+        }
+        #endregion
+    }
+}
